@@ -1,18 +1,15 @@
 '''
-TODO
-get CUDA working... issues with queue
-get batch_size working... not worth it
-
-human not moving while training rnn
+What  I haven't bothered TODO
+ - get CUDA working... issues with queue
+ - get batch_size working... not worth it
 '''
 
 import argparse
-from os import mkdir, unlink, listdir, getpid
+from os import mkdir, unlink
 from os.path import join, exists
 from pickle import decode_long
 from time import sleep, time
 import sys
-import random
 import cma
 import gym 
 import numpy as np
@@ -20,14 +17,12 @@ import matplotlib.pyplot as plt
 from collections import namedtuple
 from tqdm import tqdm
 import torch
-import torch as pt
 from torch import nn, optim, distributions
-import matplotlib.pyplot as plt
 
 # import torch.nn.functional as F
 # from torch.autograd import Variable
 from torch.multiprocessing import Process, Queue
-import gym_gazeboros_ac
+import gym
 
 
 
@@ -37,27 +32,20 @@ device = 'cpu' # torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 RANDOMSEED = 42  # random seed
 torch.manual_seed(RANDOMSEED)
 np.random.seed(RANDOMSEED)
-torch.manual_seed(RANDOMSEED)
 
-# FloatTensor = torch.cuda.FloatTensor if use_cuda else torch.FloatTensor
-# LongTensor = torch.cuda.LongTensor if use_cuda else torch.LongTensor
-# ByteTensor = torch.cuda.ByteTensor if use_cuda else torch.ByteTensor
+
 
 ###############################  hyper parameters  #########################
-ENV_NAME = 'gazeborosAC-v0'  # environment name
-#ENV_NAME = "LunarLander-v2"
-batch_size = 1 # 128 # TODO fix https://github.com/ctallec/world-models/blob/master/trainmdrnn.py
-# GAMMA = 0.999
-# EPS_START = 0.9
-# EPS_END = 0.05
-# EPS_DECAY = 200
-LR = 0.001
-# reward = 1
-latent_space = 64 # hidden of the LSTM & of the controller 
-# gaussian = 5
+ENV_NAME = "LunarLander-v2"
+SLEEP_TIME = 0.3
 
-pop_size = 2 #4
-n_samples = 2 #4
+batch_size = 1 # 128 # TODO fix https://github.com/ctallec/world-models/blob/master/trainmdrnn.py
+latent_space = 128 # hidden of the LSTM & of the controller 
+
+num_episodes = 1
+
+pop_size = 4
+n_samples = 4
 
 # num_workers if you change from 1, then you'll have to fix env.set_agent which is hardcoded :) 
 num_workers = 1 # 32 # not sure if any benefit from more than 3 workers 
@@ -65,31 +53,13 @@ num_workers = min(num_workers, n_samples * pop_size)
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--logdir", default="model_weights/world_model_"+ENV_NAME, type=str, help="Where everything is stored.")
-parser.add_argument("--display", default=True, action="store_true", help="Use progress bars if specified.")
+parser.add_argument("--logdir", default="model_weights\\world_model_"+ENV_NAME, type=str, help="Where everything is stored.")
 args = parser.parse_args()
 
 time_limit = 1000
 print(f"args.logdir {args.logdir}")
-print("First") # this gets called from every process, but not if its in main()... 
+# print("First") # this gets called from every process, but not if its in main()... 
 ############################################################################
-
-# unused..
-# def gmm_loss(batch, mus, sigmas, logpi, reduce: bool = True):
-#     batch = batch.unsqueeze(-2)
-#     normal_dist = distributions.Normal(mus, sigmas)
-#     g_log_probs = distributions.normal_dist.log_prob(batch)
-#     g_log_probs = logpi + torch.sum(g_log_probs, dim=-1)
-#     max_log_probs = torch.max(g_log_probs, dim=-1, keepdim=True)[0]
-#     g_log_probs = g_log_probs - max_log_probs
-
-#     g_probs = torch.exp(g_log_probs)
-#     probs = torch.sum(g_probs, dim=-1)
-
-#     log_prob = max_log_probs.squeeze() + torch.log(probs)
-#     if reduce:
-#         return -torch.mean(log_prob)
-#     return -log_prob
 
 
 class RNN(nn.Module):
@@ -98,19 +68,22 @@ class RNN(nn.Module):
         self.action_dim = act_dim
         self.observation_dim = obs_dim
         self.hidden = hid_dim
-        # self.reward = reward
-        self.learning_r = LR
-        # self.gaussian_mix = gaussian
-        # gmm_out = (2*obs_dim+1) * gaussian + 2
 
-        self.rnn = nn.LSTMCell(obs_dim + act_dim, hid_dim)
-        self.fc = nn.Linear(obs_dim + hid_dim, act_dim)
+        # LSTM can have num_layers=2
+        self.rnn_1 = nn.LSTMCell(input_size = obs_dim + act_dim, hidden_size=hid_dim)
+        self.rnn_2 = nn.LSTMCell(input_size=hid_dim, hidden_size=hid_dim)
+        # self.linear = nn.Linear(hid_dim, hid_dim)
         self.mu = nn.Linear(hid_dim, obs_dim)
         self.logsigma = nn.Linear(hid_dim, obs_dim)
+        
+        self.fc = nn.Linear(obs_dim + hid_dim, act_dim)
+
 
     def forward(self, obs, act, hid):
         x = torch.cat([act, obs], dim=-1)
-        h, c = self.rnn(x, hid)
+        h, c = self.rnn_1(x, hid)
+        h, c = self.rnn_2(h)
+        # h = self.linear(h) 
         mu = self.mu(h)
         # print("what is mu", mu)
         sigma = torch.exp(self.logsigma(h))
@@ -123,7 +96,8 @@ class RNN(nn.Module):
         # print(obs.size()) (1, 8)
         # print(h.size()) # (batch_size, 64)
         state = torch.cat([obs, h], dim=-1)
-        return torch.tanh(self.fc(state))
+        # return torch.tanh(self.fc(state))
+        return self.fc(state)    
 
 
 class Controller(nn.Module):
@@ -138,35 +112,13 @@ class Controller(nn.Module):
             recurrents: [Same as the hidden Dim of the LSTM]
         """
         super().__init__()
+        print(f'Controller maps {latents + recurrents} to {actions}, which we argmax over')
         self.fc = nn.Linear(latents + recurrents, actions)
 
     def forward(self, obs, h):
-        # print("we are in controller class?")
+        # print(f"obs.size {obs.size()} | h.size {h.size()}")
         state = torch.cat([obs, h], dim=-1)
         return self.fc(state)
-
-
-class ReplayMemory(object):
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.memory = []
-        self.position = 0
-        self.Transition = namedtuple(
-            "Transition", ("state", "action", "next_state", "reward")
-        )
-
-    def push(self, *args):
-        """Saves a transition."""
-        if len(self.memory) < self.capacity:
-            self.memory.append(None)
-        self.memory[self.position] = self.Transition(*args)
-        self.position = (self.position + 1) % self.capacity
-
-    def sample(self, batch_size):
-        return random.sample(self.memory, batch_size)
-
-    def __len__(self):
-        return len(self.memory)
 
 
 class RolloutGenerator(object):
@@ -187,29 +139,29 @@ class RolloutGenerator(object):
         # Loading world model and vae
         # references: https://github.com/ctallec/world-models/blob/master/utils/misc.py
         ctrl_file = join(mdir, "ctrl", "best.tar")
-        obs_dim = 50 #8 #TODO these need to be fixed for our environment
-        act_dim = 2   #2 #TODO these need to be fixed for out environment
+        # obs_dim = 50  #8 #TODO these need to be fixed for our environment
+        # act_dim = 2   #2 #TODO these need to be fixed for out environment
+        # obs_dim = self.env.observation_space.shape[0]
+        # act_dim = env.action_space.shape[0]
         self.model = rnn
-        # TODO this is the right place to load the rnn weights
         # self.model.load_state_dict({k.strip('_l0'): v for k, v in rnn_state['state_dict'].items()})
         self.controller = Controller(obs_dim, act_dim).to(device)
 
         # load controller if it was previously saved
         if exists(ctrl_file):
             ctrl_state = torch.load(ctrl_file, map_location={"cuda:0": str(device)})
-            print(f"Loading Controller with reward {ctrl_state['reward']}")
+            print(f"Loading Controller with reward {-ctrl_state['reward']}")
             self.controller.load_state_dict(ctrl_state["state_dict"])
         else:
             print("\n\nController weights not found!\n\n")
 
-        self.env = env #gym.make(ENV_NAME)
-        print(f'\n\n\nMade ENV in `RolloutGenerator`. Set agent to #1, hardcoded...\n\n\n')
+        self.env = gym.make(ENV_NAME)
         # self.env.set_agent(1)
         self.device = device
 
         self.time_limit = time_limit
 
-    def get_action_and_transition(self, hidden, seq_len=1600):
+    def get_action_and_transition(self, seq_len=1600):
         """Get action and transition.
         Encode obs to latent using the VAE, then obtain estimation for next
         latent and next hidden state using the MDRNN and compute the controller
@@ -220,24 +172,14 @@ class RolloutGenerator(object):
             - action: 1D np array
             - next_hidden (1 x 256) torch tensor
         """
-        obs_dim = self.env.observation_space.shape[0]  # this is for the lunar lander environment
-        # act_dim = env.action_space.shape[0]
-        act_dim = self.env.action_space.n
-        # print(obs_dim)
-        # print(seq_len)
-        # obs_dim_ze = np.zeros((seq_len, obs_dim))
-        obs_data = np.zeros((seq_len + 1, obs_dim))
-        act_data = np.zeros((seq_len, act_dim))
-
         obs = self.env.reset()
         hid = (torch.zeros(1, latent_space), torch.zeros(1, latent_space))  # h  # c $ TODO 64 changed to latent_space, which is 64 
-
         obs = torch.from_numpy(obs).unsqueeze(0)
+        # print(f'hid[0] {hid[0].size()}  | obs is {obs.size()}')
         act = self.controller.forward(obs, hid[0])
-        # act = torch.tensor([[0,0 ,0 ,0]])
         _, _, hid = self.model.forward(obs, act, hid)
-        m = nn.Softmax(dim=1)
-        act = m(act)
+        # m = nn.Softmax(dim=1)
+        # act = m(act)
         act = torch.argmax(act)
         act = act.cpu().numpy()
         # _, latent_mu, _ = self.vae(obs)
@@ -255,23 +197,17 @@ class RolloutGenerator(object):
         # copy params into the controller
         if params is not None:
             load_parameters(params, self.controller)
-        print(f'we are in `rollout`', env)
-        obs = env.reset() # was self.
-        print(obs)
-        hidden = [torch.zeros(1, latent_space).to(self.device) for _ in range(2)] # 1 should be batch_size. TODO 64 changed to latent_space
-
+        obs = self.env.reset() # was self.
         cumulative = 0
         i = 0
         
 
         while True:
-            action, hidden = self.get_action_and_transition(hidden)
-            print(action)
+            action, hidden = self.get_action_and_transition()
             obs, reward, done, _ = self.env.step(action)
 
-            if render or i == 0:  # This first render is required! # TODO is it? 
-                # self.env.render()
-                pass
+            if render:
+                self.env.render()
 
             cumulative += reward
 
@@ -280,7 +216,6 @@ class RolloutGenerator(object):
                 return -cumulative
             i += 1
         
-
 
 ################################################################################
 #                           Thread routines                                    #
@@ -316,9 +251,9 @@ def slave_routine(p_queue, r_queue, e_queue, p_index, model):
         while e_queue.empty():
             if p_queue.empty():
                 # print("we are in if statement")
-                sleep(0.1)
+                sleep(SLEEP_TIME)
             else:
-                print("we are in else statement")
+                # print("we are in else statement")
                 s_id, params = p_queue.get()
                 # print("we are putting stuff in r_queue")
                 r_queue.put((s_id, r_gen.rollout(params)))
@@ -327,8 +262,6 @@ def slave_routine(p_queue, r_queue, e_queue, p_index, model):
 ################################################################################
 #                           Controller                                         #
 ################################################################################
-
-
 def unflatten_parameters(params, example, device):
     """Unflatten parameters.
     :args params: parameters as a single 1D np array
@@ -340,7 +273,7 @@ def unflatten_parameters(params, example, device):
     params = torch.Tensor(params).to(device)
     idx = 0
     unflattened = []
-    print(f'params.size is {params.size()}\n\n')
+    # print(f'params.size is {params.size()}\n\n')
     for e_p in example:
         unflattened += [params[idx : idx + e_p.numel()].view(e_p.size())]
         idx += e_p.numel()
@@ -376,17 +309,17 @@ rnn_dir = join(args.logdir, "rnn")
 if not exists(rnn_dir):
     mkdir(rnn_dir)
 
-if __name__ == "__main__":
-    #TODO: anthony said to append obstacles onto state -> to get laser scan!
-    #Anthony made changes to gym environment
 
-    env = gym.make(ENV_NAME)
-    #env.seed(RANDOMSEED)
-    env.set_agent(0)
-    
-    obs_dim = env.observation_space.shape[0]  # this is for our environment -> 67 dimensions: 47 = system state + 20 = laser scan
-    act_dim = env.action_space.shape[0]
-    #act_dim = env.action_space.n
+## Global
+env = gym.make(ENV_NAME)
+#env.seed(RANDOMSEED)
+
+obs_dim = env.observation_space.shape[0] 
+# act_dim = env.action_space.shape[0]
+act_dim = env.action_space.n
+
+if __name__ == "__main__":
+
 
     print("obs_dim + act_dim", obs_dim + act_dim)
     model = RNN(obs_dim, act_dim)
@@ -394,7 +327,7 @@ if __name__ == "__main__":
     ctrl_filename = ctrl_dir + "/best.tar"
    
     try:
-        model.load_state_dict(pt.load(rnn_filename))
+        model.load_state_dict(torch.load(rnn_filename))
         print(f"LSTM weights loaded")
     except Exception as e:
         print(f"Error in loading weights, file might not be found or model may have changed\n{e}\n\n")
@@ -402,19 +335,19 @@ if __name__ == "__main__":
     model.zero_grad()
     model.to(device)
 
-    params = [p for p in model.parameters() if p.requires_grad]
+    # params = [p for p in model.parameters() if p.requires_grad]
 
     optimizer = optim.RMSprop(model.parameters())
     criterion = torch.nn.MSELoss()
     # softmax = nn.Softmax(dim=1)
     
     losses = []
-    ls = []
-    num_episodes = 1 #ANTHONY SAID THIS SHOULD BE 100
-    episode_length = 45 #SET TO 45 FOR EP LENGTH FOR GYMGAZEBOROS
+    rewards = [] 
+    epoch_count = []
+    
     print("#################### LETS DO THE RNN ###############################")
 
-    epoch_count = []
+
     #TODO: IMPORTANT: ANTHONY SAID TO MAKE SURE EVERY INNER LOOP  15 SECONDS -> 
     #Suggestion: ANTHONY -> said to do a data collection before training
     
@@ -423,72 +356,91 @@ if __name__ == "__main__":
         state = env.reset()
         #state = torch.Tensor([state]) #this might have to changed depending on how the state is structured
         state = torch.from_numpy(np.array([state], dtype=np.float32))
-        hid = (torch.zeros(batch_size, model.hidden, dtype=pt.float), # .to(device)
-               torch.zeros(batch_size, model.hidden, dtype=pt.float))
-        #ls = [] # TODO maybe this should be in the loop with `loss = 0.0` since len(ls) is use for a norm (for the loss)  -> i dont think we need this atm
-        ls.append(state)
+        hid = (torch.zeros(batch_size, model.hidden, dtype=torch.float), # .to(device)
+               torch.zeros(batch_size, model.hidden, dtype=torch.float))
         epoch_count.append(i_episode)
-        loss = 0.0
+        loss = 0.0 
         now = time()
-        for i in range(0, episode_length):
-            state = state #.to(device=device)
+        episode_length = 0 
+        while True:
+            # state = state #.to(device=device)
+            pred = model.step(state, hid[0]).detach()
+                        
+            # Continous
+            # action = pred.clamp(min=-1, max=1).numpy().flatten()  # ensure bounds
             
-            #ls.append(state)
+            # Discrete
+            action = torch.argmax(pred).numpy()
 
-            # act_batch = len(ls)
-            pred = model.step(state, hid[0])
-            #TODO: action goal is a x, y vector that is translative to the robot
-            #Important to acknowledge: Obstacle Avoidance -> if for some reason this doesnt work -> we might want our thing to output a linear and angular velocity. -> we will have to transition that to the robot-robot using the TEB
-            action = pred.detach().clamp(min=-1, max=1).numpy().flatten()  # ensure bounds
-            print(f'action = {action}')
+            # print(f'action = {action}')
             mu, sigma, hid = model.forward(state, pred, hid)
 
-            #sleep(0.1) #TODO ANTHONY SAID TO INSERT SLEEP 
-            state, _, done,_  = env.step(action) #not sure what the data structure is  #TODO need to to put variable instead of underscore!!! 
+            #sleep(SLEEP_TIME) #TODO ANTHONY SAID TO INSERT SLEEP 
+            state, reward, done,_  = env.step(action)
 
 
             # print(f'state before {state}')
             # print(f'state mid    {np.array([state)}')
-            # TODO #this might have to changed depending on how the state is structured -> make more efficient --> the next state is this and we use this next state to calcualte the log_prob in the loss function
+            # this might have to changed depending on how the state is structured -> make more efficient --> the next state is this and we use this next state to calcualte the log_prob in the loss function
             state = torch.from_numpy(np.array([state], dtype=np.float32)) 
 
 
-            #print("this si the next state", state)
             dist = distributions.Normal(loc=mu, scale=sigma)
-            nll = -dist.log_prob(state)  # negative log-likelihood of the next state!
+            nll = -dist.log_prob(state)     # negative log-likelihood of the next state!
             nll = torch.mean(nll, dim=-1)   # mean over dimensions # TODO use mean or sum? 
             nll = torch.mean(nll, dim=0)    # mean over batch
             loss += nll
             # print(done)
-            # if done:
-            #     break
+            episode_length+=1
+            if done:
+                break
 
-        print(f"time taken = {time() - now}")
-        loss = loss/episode_length  # mean over trajectory # why take the norm of an avg?  -> made it episode length instead of i
+        # print(f"")
+        loss = loss/episode_length 
         val = loss.item()
-        print(f'val  is {val}') # TODO back prop here... but loss is decreasing.. how? what? 
+
+        optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        optimizer.zero_grad()
+        
+        print(f'Epoch is {i_episode} | Rewards is {reward} | Loss: {val:.6f} | time taken = {(time() - now):.6f}')
 
-        # state = torch.tensor(state)
-        # print(f'state after {state}')
-        # print("#################### UPDATED STATE #########################")
         losses.append(val)
+        rewards.append(reward)
+
+        if i_episode % 200: 
+            torch.save(model.state_dict(), rnn_filename)
+
+    # save rewards and weights to disk
+    with open("lstm_reward.txt", "a") as f:
+        for reward in rewards:
+            f.write(f" {reward},")
     torch.save(model.state_dict(), rnn_filename)
 
-    # env.close()
-    # print('close env and sleep')
-    # sleep(3)
-    # env = gym.make(ENV_NAME)
-    # #env.seed(RANDOMSEED)
-    # env.set_agent(0)
-    # print('now we have a new env')
+    def moving_average(x, w):
+        return np.convolve(x, np.ones(w), 'valid') / w
+    window_size = 50 
+    # plt.plot(moving_average(rewards, window_size))
+    # plt.xlabel('Episode')
+    # plt.ylabel(f'Rewards (MA-{window_size})')
+    # plt.title(f'Rewards of World Model\'s LSTM')
+    # plt.savefig('Rewards with MA.png')
+    # plt.show()
+    # plt.clf()
+    # plt.cla()
+    # plt.close()
 
-    #plt.plot(epoch_count, losses)
-    #plt.show()
+    # plt.plot(moving_average(losses, window_size))
+    # plt.xlabel('Episode')
+    # plt.ylabel(f'Loss (MA-{window_size})')
+    # plt.title(f'Loss of World Model\'s LSTM')
+    # plt.savefig('Loss with MA.png')
+    # plt.show()
+    # plt.clf()
+    # plt.cla()
+    # plt.close()
     
-    cur_best = None
+    
 
     p_queue = Queue()
     r_queue = Queue()
@@ -519,7 +471,7 @@ if __name__ == "__main__":
         print("Evaluating...")
         for _ in tqdm(range(rollouts)):
             while r_queue.empty():
-                sleep(0.1)
+                sleep(SLEEP_TIME)
             restimates.append(r_queue.get()[1])
 
         return best_guess, np.mean(restimates), np.std(restimates)
@@ -529,22 +481,16 @@ if __name__ == "__main__":
     print("#################### LET US SETUP #################################")
     print(f'obs_dim, act_dim = {obs_dim} |  {act_dim}')
     controller = Controller(obs_dim, act_dim) # dummy instance
-    # TODO added by Ali. not sure why Author didn't have this here.... oh its a dummy instance -_- 
-    # try:
-    #     saved_data = torch.load(ctrl_filename) 
-    #     cur_best = -saved_data['reward']
-    #     controller.load_state_dict(pt.load(saved_data["state_dict"]))
-    #     print(f"controller weights loaded")
-    # except Exception as e:
-    #     print(f"Error in loading controller weights, file might not be found or model may have changed\n{e}\n\n")
+
 
     print("#################### CONTROLLER SETUP ##########################")
     parameters = controller.parameters()
-    es = cma.CMAEvolutionStrategy(flatten_parameters(parameters), 0.1, {"popsize": pop_size})
+    es = cma.CMAEvolutionStrategy(flatten_parameters(parameters), SLEEP_TIME, {"popsize": pop_size})
 
-    target_return = 100
+    target_return = 350
     epoch = 0
     log_step = 3
+    cur_best = None
 
     print("#################### ABOUT TO RUN CONTROLLER TRAINING ####################")
     while not es.stop():
@@ -562,25 +508,15 @@ if __name__ == "__main__":
 
         # print("we just put something in p_queue")
         
-        # retrieve results
-        if args.display:
-            pbar = tqdm(total=pop_size * n_samples)
-        #   print("pbar was done!!!")
 
-        for _ in range(pop_size * n_samples):
+
+        for _ in tqdm(range(pop_size * n_samples)):
             # print("We are in this for loop?")
             while r_queue.empty():
-                print(f'foobar')
-                sleep(0.1)
-            print(f'not foobar')
+                sleep(SLEEP_TIME)
             r_s_id, r = r_queue.get()
             r_list[r_s_id] += r / n_samples
 
-            if args.display:
-                pbar.update(1)
-        # for loop done
-        if args.display:
-            pbar.close()
 
         es.tell(solutions, r_list)
         es.disp()
@@ -588,10 +524,10 @@ if __name__ == "__main__":
         # evaluation and saving
         if epoch % log_step == log_step - 1:
             best_params, best, std_best = evaluate(solutions, r_list)
-            print(f"Current evaluation: {cur_best}+/-{std_best}") # :.2f
-            if not cur_best or cur_best > best:
+            print(f"Current evaluation: {-best}+/-{std_best}") # :.2f
+            if not cur_best or cur_best > best: # We want to minimize, this is correct 
                 cur_best = best
-                print(f"Saving...")
+                print(f"[Saving] New Best evaluation: {-cur_best}+/-{std_best}")
                 load_parameters(best_params, controller)
                 torch.save(
                     {"epoch": epoch,
@@ -599,7 +535,7 @@ if __name__ == "__main__":
                      "state_dict": controller.state_dict(), },
                         join(ctrl_dir, "best.tar"))
             if -best > target_return:
-                print(f"Terminating controller training with value {best}...")
+                print(f"Terminating controller training with value {-best}...")
                 break
 
         epoch += 1

@@ -28,7 +28,6 @@ import matplotlib.pyplot as plt
 # import torch.nn.functional as F
 # from torch.autograd import Variable
 from torch.multiprocessing import Process, Queue
-import gym_gazeboros_ac
 
 
 
@@ -38,7 +37,6 @@ device = 'cpu' # torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 RANDOMSEED = 42  # random seed
 torch.manual_seed(RANDOMSEED)
 np.random.seed(RANDOMSEED)
-torch.manual_seed(RANDOMSEED)
 
 # FloatTensor = torch.cuda.FloatTensor if use_cuda else torch.FloatTensor
 # LongTensor = torch.cuda.LongTensor if use_cuda else torch.LongTensor
@@ -54,7 +52,7 @@ batch_size = 1 # 128 # TODO fix https://github.com/ctallec/world-models/blob/mas
 # EPS_DECAY = 200
 LR = 0.001
 # reward = 1
-latent_space = 64 # hidden of the LSTM & of the controller 
+latent_space = 128 # hidden of the LSTM & of the controller 
 # gaussian = 5
 
 pop_size = 8 #4 # if this is larger than index, it will prevent a index error.
@@ -73,25 +71,25 @@ print(f"args.logdir {args.logdir}")
 print("First") # this gets called from every process, but not if its in main()... 
 ############################################################################
 
+
 class RNN(nn.Module):
     def __init__(self, obs_dim, act_dim, hid_dim=latent_space, drop_prob=0.5):
         super(RNN, self).__init__()
         self.action_dim = act_dim
         self.observation_dim = obs_dim
         self.hidden = hid_dim
-        # self.reward = reward
-        self.learning_r = LR
-        # self.gaussian_mix = gaussian
-        # gmm_out = (2*obs_dim+1) * gaussian + 2
 
-        self.rnn = nn.LSTMCell(obs_dim + act_dim, hid_dim)
+        # LSTM can have num_layers=2
+        self.rnn_1 = nn.LSTMCell(input_size = obs_dim + act_dim, hidden_size=hid_dim)
+        self.rnn_2 = nn.LSTMCell(input_size=hid_dim, hidden_size=hid_dim)
         self.fc = nn.Linear(obs_dim + hid_dim, act_dim)
         self.mu = nn.Linear(hid_dim, obs_dim)
         self.logsigma = nn.Linear(hid_dim, obs_dim)
 
     def forward(self, obs, act, hid):
         x = torch.cat([act, obs], dim=-1)
-        h, c = self.rnn(x, hid)
+        h, c = self.rnn_1(x, hid)
+        h, c = self.rnn_2(h)
         mu = self.mu(h)
         # print("what is mu", mu)
         sigma = torch.exp(self.logsigma(h))
@@ -104,8 +102,7 @@ class RNN(nn.Module):
         # print(obs.size()) (1, 8)
         # print(h.size()) # (batch_size, 64)
         state = torch.cat([obs, h], dim=-1)
-        # return torch.tanh(self.fc(state))
-        return self.fc(state)
+        return torch.tanh(self.fc(state))
 
 
 class Controller(nn.Module):
@@ -120,14 +117,14 @@ class Controller(nn.Module):
             recurrents: [Same as the hidden Dim of the LSTM]
         """
         super().__init__()
+        print(f'Controller maps {latents + recurrents} to {actions}, which we argmax over')
         self.fc = nn.Linear(latents + recurrents, actions)
 
     def forward(self, obs, h):
-        # print("we are in controller class?")
-        # print(obs.size())
-        # print(h.size())
+        # print(f"obs.size {obs.size()} | h.size {h.size()}")
         state = torch.cat([obs, h], dim=-1)
         return self.fc(state)
+
 
 
 
@@ -396,7 +393,7 @@ if __name__ == "__main__":
         # print(f"time taken = {time() - now}")
         # print(f'val  is {val}')
         print(f'reward  is {reward}')
-        loss = loss/episode_length 
+        loss = loss/i # TODO Why bother normalizing loss by a constant. use i not episode_length
         val = loss.item()
 
         loss.backward()
